@@ -1,173 +1,121 @@
-// Pedestrians: Solmar Bay residents strolling the sidewalks. They walk the
-// pavement network corner to corner, flee from gunfire and fast cars, fight
-// back if punched, and go down when hurt badly.
+// peds.js — pedestrians: they stroll the sidewalks around each block,
+// flee gunfire and fast cars, and go down when hurt.
 
-import { clamp, angleTo, turnToward, pick } from './util.js';
+import { clamp, dist, pick, randRange, TAU } from './util.js';
 
-const SHIRTS = ['#d95f4b', '#4b7fd9', '#f2f2f2', '#57a773', '#e9c46a', '#9b5de5', '#ef8354', '#6fb3b8'];
-const SKIN = ['#f1c27d', '#e0ac69', '#c68642', '#8d5524', '#ffdbac'];
+const SKIN = ['#f2c79b', '#c68863', '#8a5a3b', '#e8b48c'];
+const CLOTHES = ['#d95f4b', '#4b7fd9', '#59b06a', '#e3b341', '#9a6fc0', '#e8e4da', '#4fb3b3', '#d97fb0'];
 
-export function makePed(x, y, rng) {
-  return {
-    x, y,
-    angle: rng() * Math.PI * 2,
-    speed: 0,
-    walkSpeed: 52 + rng() * 30,
-    health: 100,
-    state: 'walk', // 'walk' | 'flee' | 'down'
-    shirt: pick(rng, SHIRTS),
-    skin: pick(rng, SKIN),
-    waypoint: null,
-    fleeFrom: null,
-    fleeFor: 0,
-    downFor: 0,
-    phase: rng() * Math.PI * 2,
-  };
-}
-
-// A point on a sidewalk: just off a road, along a random block edge.
-function sidewalkPoint(G) {
-  const world = G.world;
-  const rng = G.rng;
-  const vertical = rng() < 0.5;
-  if (vertical) {
-    const road = pick(rng, world.vRoads);
-    const side = rng() < 0.5 ? -1 : 1;
-    return { x: road + side * 46, y: 60 + rng() * 2150 };
+export function spawnPeds(world, rng, n) {
+  const peds = [];
+  for (let i = 0; i < n; i++) {
+    const block = pick(rng, world.pedBlocks);
+    const per = 2 * (block.w + block.h);
+    peds.push({
+      block, s: rng() * per, per,
+      dir: rng() < 0.5 ? 1 : -1,
+      speed: randRange(rng, 34, 58),
+      x: 0, y: 0, angle: 0,
+      skin: pick(rng, SKIN), shirt: pick(rng, CLOTHES),
+      state: 'walk', fleeT: 0, fleeX: 0, fleeY: 0, downT: 0, step: rng() * TAU,
+    });
+    placeOnBlock(peds[i]);
   }
-  const road = pick(rng, world.hAll);
-  const side = rng() < 0.5 ? -1 : 1;
-  return { x: 60 + rng() * (world.w - 120), y: road + side * 46 };
+  return peds;
 }
 
-export function spawnPeds(G, count) {
-  for (let i = 0; i < count; i++) {
-    const p = sidewalkPoint(G);
-    const ped = makePed(p.x, p.y, G.rng);
-    ped.waypoint = sidewalkPoint(G);
-    G.peds.push(ped);
-  }
+// Position along the block perimeter for parameter s.
+function placeOnBlock(p) {
+  const { x, y, w, h } = p.block;
+  let s = ((p.s % p.per) + p.per) % p.per;
+  if (s < w) { p.x = x + s; p.y = y; p.angle = 0; }
+  else if ((s -= w) < h) { p.x = x + w; p.y = y + s; p.angle = Math.PI / 2; }
+  else if ((s -= h) < w) { p.x = x + w - s; p.y = y + h; p.angle = Math.PI; }
+  else { s -= w; p.x = x; p.y = y + h - s; p.angle = -Math.PI / 2; }
+  if (p.dir < 0) p.angle += Math.PI;
 }
 
-export function spawnFleeingPed(G, x, y, fromX, fromY) {
-  const ped = makePed(x, y, G.rng);
-  ped.state = 'flee';
-  ped.fleeFrom = { x: fromX, y: fromY };
-  ped.fleeFor = 3;
-  G.peds.push(ped);
-  return ped;
-}
+export function updatePeds(G, dt) {
+  const threat = G.threat; // {x, y, t} recent violence, or null
+  for (const p of G.peds) {
+    if (p.state === 'down') { p.downT += dt; continue; }
+    p.step += dt * (p.state === 'flee' ? 13 : 8);
 
-export function updatePed(G, ped, dt) {
-  if (ped.state === 'down') {
-    ped.downFor += dt;
-    return;
-  }
-  let tx;
-  let ty;
-  let speed = ped.walkSpeed;
-  if (ped.state === 'flee') {
-    ped.fleeFor -= dt;
-    if (ped.fleeFor <= 0 || !ped.fleeFrom) {
-      ped.state = 'walk';
-      ped.waypoint = sidewalkPoint(G);
+    if (threat && threat.t > 0 && dist(p.x, p.y, threat.x, threat.y) < 190 && p.state !== 'flee') {
+      p.state = 'flee'; p.fleeT = randRange(G.rng, 1.2, 2.2);
+      const a = Math.atan2(p.y - threat.y, p.x - threat.x);
+      p.fleeX = Math.cos(a); p.fleeY = Math.sin(a);
+    }
+    // Flee fast cars bearing down on them too.
+    if (p.state !== 'flee') {
+      for (const car of G.solidCars()) {
+        if (Math.abs(car.speed) > 120 && dist(p.x, p.y, car.x, car.y) < 62) {
+          p.state = 'flee'; p.fleeT = 1.1;
+          const a = Math.atan2(p.y - car.y, p.x - car.x);
+          p.fleeX = Math.cos(a); p.fleeY = Math.sin(a);
+          break;
+        }
+      }
+    }
+
+    if (p.state === 'flee') {
+      p.fleeT -= dt;
+      const sp = 148;
+      const res = G.collideWorld(p.x + p.fleeX * sp * dt, p.y + p.fleeY * sp * dt, 7);
+      p.x = res.x; p.y = res.y;
+      p.angle = Math.atan2(p.fleeY, p.fleeX);
+      if (p.fleeT <= 0) { p.state = 'walk'; snapToBlock(p); }
     } else {
-      const away = Math.atan2(ped.y - ped.fleeFrom.y, ped.x - ped.fleeFrom.x);
-      tx = ped.x + Math.cos(away) * 120;
-      ty = ped.y + Math.sin(away) * 120;
-      speed = 158;
-    }
-  }
-  if (ped.state === 'walk') {
-    if (!ped.waypoint || Math.hypot(ped.waypoint.x - ped.x, ped.waypoint.y - ped.y) < 12) {
-      ped.waypoint = sidewalkPoint(G);
-    }
-    tx = ped.waypoint.x;
-    ty = ped.waypoint.y;
-  }
-  const desired = angleTo(ped.x, ped.y, tx, ty);
-  ped.angle = turnToward(ped.angle, desired, 6 * dt);
-  ped.speed = speed;
-  let nx = ped.x + Math.cos(ped.angle) * speed * dt;
-  let ny = ped.y + Math.sin(ped.angle) * speed * dt;
-  if (G.world.isWater(nx, ny)) {
-    ped.angle += Math.PI * dt * 2;
-    nx = ped.x;
-    ny = ped.y;
-  }
-  const res = G.world.collideCircle(nx, ny, 8);
-  ped.x = clamp(res.x, 10, G.world.w - 10);
-  ped.y = clamp(res.y, 10, G.world.h - 6);
-  ped.phase += dt * (speed / 9);
-}
-
-// Hurt a pedestrian. Returns true when this blow puts them down.
-export function hurtPed(G, ped, dmg) {
-  if (ped.state === 'down') return false;
-  ped.health -= dmg;
-  if (ped.health <= 0) {
-    ped.state = 'down';
-    ped.downFor = 0;
-    ped.speed = 0;
-    return true;
-  }
-  ped.state = 'flee';
-  ped.fleeFrom = { x: G.player.x, y: G.player.y };
-  ped.fleeFor = 2.5;
-  return false;
-}
-
-// Nearby pedestrians panic and run from a scare at (x, y).
-export function scarePeds(G, x, y, radius) {
-  for (const ped of G.peds) {
-    if (ped.state === 'down') continue;
-    if (Math.hypot(ped.x - x, ped.y - y) < radius) {
-      ped.state = 'flee';
-      ped.fleeFrom = { x, y };
-      ped.fleeFor = 2 + G.rng() * 1.5;
+      p.s += p.dir * p.speed * dt;
+      placeOnBlock(p);
     }
   }
 }
 
-export function drawPed(c, ped) {
-  c.save();
-  c.translate(ped.x, ped.y);
-  if (ped.state === 'down') {
-    c.rotate(ped.angle);
-    c.fillStyle = 'rgba(40,30,20,0.25)';
-    c.beginPath();
-    c.ellipse(0, 2, 13, 6, 0, 0, Math.PI * 2);
-    c.fill();
-    c.fillStyle = ped.shirt;
-    c.beginPath();
-    c.ellipse(0, 0, 12, 5, 0, 0, Math.PI * 2);
-    c.fill();
-    c.fillStyle = ped.skin;
-    c.beginPath();
-    c.arc(13, 0, 4, 0, Math.PI * 2);
-    c.fill();
-    c.restore();
+// After fleeing, adopt the nearest block as the new stroll.
+function snapToBlock(p) {
+  // Keep the same block: project position back onto its perimeter coarsely
+  // by restarting the walk at the nearest corner parameter.
+  let best = 0, bestD = Infinity;
+  for (let s = 0; s < p.per; s += 8) {
+    const q = { block: p.block, s, per: p.per, x: 0, y: 0, angle: 0, dir: p.dir };
+    placeOnBlock(q);
+    const d = dist(p.x, p.y, q.x, q.y);
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  p.s = best;
+}
+
+export function hurtPed(G, ped, cause) {
+  if (ped.state === 'down') return;
+  ped.state = 'down';
+  ped.downT = 0;
+  G.onPedDown(ped, cause);
+}
+
+export function drawPed(ctx, p, time) {
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  if (p.state === 'down') {
+    ctx.rotate(p.angle + Math.PI / 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath(); ctx.ellipse(0, 2, 12, 5, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = p.shirt; ctx.fillRect(-11, -3.5, 15, 7);
+    ctx.fillStyle = p.skin; ctx.beginPath(); ctx.arc(8, 0, 4.4, 0, TAU); ctx.fill();
+    ctx.restore();
     return;
   }
-  const bob = Math.sin(ped.phase) * 1.3;
-  c.fillStyle = 'rgba(40,30,20,0.25)';
-  c.beginPath();
-  c.ellipse(0, 3, 7, 3.4, 0, 0, Math.PI * 2);
-  c.fill();
-  c.fillStyle = ped.shirt;
-  c.beginPath();
-  c.arc(0, bob * 0.3, 6, 0, Math.PI * 2);
-  c.fill();
-  c.fillStyle = ped.skin;
-  c.beginPath();
-  c.arc(0, -1 + bob * 0.3, 3.6, 0, Math.PI * 2);
-  c.fill();
-  // A little direction tick so movement reads at a glance.
-  c.strokeStyle = ped.shirt;
-  c.lineWidth = 2;
-  c.beginPath();
-  c.moveTo(0, 0);
-  c.lineTo(Math.cos(ped.angle) * 7, Math.sin(ped.angle) * 7);
-  c.stroke();
-  c.restore();
+  // Shadow + legs (simple two-step bob) + body + head.
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath(); ctx.ellipse(0, 3, 6.5, 3.4, 0, 0, TAU); ctx.fill();
+  const bob = Math.sin(p.step) * 2.2;
+  ctx.fillStyle = '#2e3440';
+  ctx.fillRect(-3.4 + bob * 0.4, 0.5, 3, 5.5);
+  ctx.fillRect(-0.6 - bob * 0.4, 0.5, 3, 5.5);
+  ctx.fillStyle = p.shirt;
+  ctx.beginPath(); ctx.arc(0, -1, 5.4, 0, TAU); ctx.fill();
+  ctx.fillStyle = p.skin;
+  ctx.beginPath(); ctx.arc(0, -2.2, 3.4, 0, TAU); ctx.fill();
+  ctx.restore();
+  void time;
 }

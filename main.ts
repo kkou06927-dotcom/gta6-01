@@ -1,11 +1,14 @@
-// A working gta6-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. The game itself is Solmar Bay Heat, an
-// original top-down open-world crime game: explore a sun-soaked coastal city on foot or by car,
-// steal cars, run three story missions for fixer Dario Fenn, fight and flee the Solmar Bay PD
-// under a rising wanted level, with traffic, pedestrians, a minimap HUD and local saves.
+// Solmar Bay Heat — an original open-world crime game, and this program hands it in
+// (Node 22, standard library only). The game is this directory's game/ folder: plain static
+// files a desktop browser loads offline (game/index.html and its ES modules, no library and
+// no network request). You are Rico Marín, a broke wheelman in the sun-soaked coastal city
+// of Solmar Bay: explore on foot or steal any car, run three story missions for fixer Dario
+// Fenn to clear a $5,000 debt to smuggler Ilya Brandt, and stay ahead of the SBPD — wanted
+// stars, chases, a bust meter, busted/downed respawns, and progress saved in the browser.
+// This program copies game/ and screenshots/ from beside this file to /output and writes
+// /output/dossier.json, the summary the judge reads, with the vendored make.fun library.
+// The 4 screenshots in screenshots/ are the game's ?demo= scenes (city, drive, chase,
+// mission); the first by name is the cover.
 //
 // Serve it locally with `node serve.ts`, then open http://localhost:8080.
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:

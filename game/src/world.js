@@ -1,381 +1,336 @@
-// The city of Solmar Bay: a sun-soaked coastal grid of pastel blocks, palm
-// promenades and one long beach. This module owns the map layout, the road
-// network, collision against buildings, and a pre-rendered static picture of
-// the whole city that the main loop blits each frame.
+// world.js — the city of Solmar Bay: layout, points of interest, collision,
+// and a pre-rendered static map the game blits from each frame.
+//
+// Layout: a grid of avenues over 3200x2400 px. The south edge is beach and
+// sea, the south-east corner is the docks, and named POI blocks (police HQ,
+// hospital, bank, hotel, Fenn's Garage, the hideout) anchor the missions.
 
-import { clamp, mulberry32, pick, shade, resolveCircleRect } from './util.js';
+import { mulberry32, clamp, circleRectResolve } from './util.js';
 
-export const WORLD_W = 3072;
-export const WORLD_H = 2560;
-export const ROAD_W = 72;
-export const PITCH = 256;
-export const BEACH_Y = 2304; // sand starts here
-export const WATER_Y = 2432; // open water starts here
-export const PROMENADE_Y = 2256; // beachfront road centre line
+export const WORLD_W = 3200;
+export const WORLD_H = 2400;
+export const ROADS_V = [300, 700, 1100, 1500, 1900, 2300, 2700];
+export const ROADS_H = [300, 700, 1100, 1500, 1900];
+export const ROAD_W = 96;
+const HALF = ROAD_W / 2;
+export const BEACH_Y = 2060;   // sand starts
+export const WATER_Y = 2290;   // sea starts (solid for cars and feet)
 
-const PALETTE = [
-  '#f2e3c9', '#e8b4a0', '#d98e73', '#a8c3bc', '#7fb3b0',
-  '#f4d58d', '#e07a5f', '#81b29a', '#f2cc8f', '#c9ada7',
-  '#dbe7c8', '#e5c1a8',
-];
+const ROOF_COLORS = ['#e8b4a0', '#d98c7a', '#f2d38a', '#a8c6d8', '#c3b2d9', '#f0e0b6', '#e59a8a', '#9fc9a8', '#eec27f', '#b5d3e7'];
 
-export function createWorld(seed = 1337) {
-  const rng = mulberry32(seed);
+export function createWorld(seed) {
+  const rng = mulberry32(seed ^ 0x5eed);
+  const buildings = [];   // solid rects {x,y,w,h}
+  const lots = [];        // parking lot rects
+  const pedBlocks = [];   // rects pedestrians stroll around (sidewalk inset)
+  const parkingSpots = []; // {x,y,angle}
+  const pois = {};
 
-  // Road centre lines. Vertical roads run the full height down to the
-  // promenade; horizontal roads span the full width.
-  const vRoads = [];
-  for (let i = 0; i < 12; i++) vRoads.push(128 + PITCH * i);
-  const hRoads = [];
-  for (let j = 0; j < 9; j++) hRoads.push(128 + PITCH * j);
-  const hAll = [...hRoads, PROMENADE_Y];
+  // Block grid: cells between roads.
+  const xs = [0, ...ROADS_V, WORLD_W];
+  const ys = [0, ...ROADS_H, WORLD_H];
+  const blockRect = (c, r) => ({
+    x: xs[c] + HALF, y: ys[r] + HALF,
+    w: xs[c + 1] - HALF - (xs[c] + HALF),
+    h: ys[r + 1] - HALF - (ys[r] + HALF),
+  });
 
-  const intersections = [];
-  for (const x of vRoads) for (const y of hAll) intersections.push({ x, y });
+  // Named POI blocks by [col,row].
+  const poiBlocks = {
+    '0,0': 'hideout', '4,1': 'hospital', '1,2': 'garage', '3,2': 'police',
+    '3,3': 'bank', '6,3': 'hotel',
+  };
+  const parkBlocks = new Set(['2,1', '5,3', '1,4']);
+  const lotBlocks = new Set(['4,2', '6,1', '2,4']);
 
-  const buildings = [];
-  const parks = [];
-  const lots = [];
-  const palms = [];
+  const drawJobs = []; // filled with closures that paint the static map
 
-  // Blocks: the cells between neighbouring roads.
-  for (let i = 0; i < 11; i++) {
-    for (let j = 0; j < 8; j++) {
-      const x0 = vRoads[i] + ROAD_W / 2;
-      const y0 = hRoads[j] + ROAD_W / 2;
-      const x1 = vRoads[i + 1] - ROAD_W / 2;
-      const y1 = hRoads[j + 1] - ROAD_W / 2;
-      const cell = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
-      const roll = rng();
-      if (roll < 0.13) {
-        parks.push(cell);
-        const n = 4 + Math.floor(rng() * 5);
-        for (let k = 0; k < n; k++) {
-          palms.push({
-            x: cell.x + 20 + rng() * (cell.w - 40),
-            y: cell.y + 20 + rng() * (cell.h - 40),
-            s: 0.8 + rng() * 0.5,
-          });
-        }
-        continue;
-      }
-      if (roll < 0.23) {
-        lots.push(cell);
-        continue;
-      }
-      const inset = 12;
-      const ix = cell.x + inset;
-      const iy = cell.y + inset;
-      const iw = cell.w - inset * 2;
-      const ih = cell.h - inset * 2;
-      const pattern = rng();
-      const addBuilding = (x, y, w, h) => {
-        const color = pick(rng, PALETTE);
-        buildings.push({ x, y, w, h, color, roof: shade(color, 0.78) });
-      };
-      if (pattern < 0.34) {
-        addBuilding(ix, iy, iw, ih);
-      } else if (pattern < 0.67) {
-        const gap = 14;
-        if (rng() < 0.5) {
-          const w = (iw - gap) / 2;
-          addBuilding(ix, iy, w, ih);
-          addBuilding(ix + w + gap, iy, w, ih);
-        } else {
-          const h = (ih - gap) / 2;
-          addBuilding(ix, iy, iw, h);
-          addBuilding(ix, iy + h + gap, iw, h);
-        }
+  for (let c = 0; c < xs.length - 1; c++) {
+    for (let r = 0; r < ys.length - 1; r++) {
+      if (r === 5) continue; // beach / docks strip handled below
+      const b = blockRect(c, r);
+      pedBlocks.push({ x: b.x + 8, y: b.y + 8, w: b.w - 16, h: b.h - 16 });
+      const key = c + ',' + r;
+      if (poiBlocks[key]) {
+        buildPoi(drawJobs, buildings, pois, poiBlocks[key], b, rng);
+      } else if (parkBlocks.has(key)) {
+        drawJobs.push((g) => paintPark(g, b, rng));
+      } else if (lotBlocks.has(key)) {
+        lots.push(b);
+        makeLotSpots(parkingSpots, b);
+        drawJobs.push((g) => paintLot(g, b));
       } else {
-        const gap = 12;
-        const w = (iw - gap) / 2;
-        const h = (ih - gap) / 2;
-        addBuilding(ix, iy, w, h);
-        addBuilding(ix + w + gap, iy, w, h);
-        addBuilding(ix, iy + h + gap, w, h);
-        addBuilding(ix + w + gap, iy + h + gap, w, h);
+        drawJobs.push((g) => paintBuildings(g, b, buildings, rng));
       }
     }
   }
 
-  // Palms along the beach and the promenade.
-  for (let x = 60; x < WORLD_W - 40; x += 84 + rng() * 40) {
-    palms.push({ x, y: BEACH_Y + 26 + rng() * 40, s: 0.9 + rng() * 0.5 });
-    if (rng() < 0.7) palms.push({ x: x + 30, y: PROMENADE_Y - 52, s: 0.75 + rng() * 0.4 });
+  // --- Beach strip, promenade, docks, beach car park ---
+  const promenade = { x: 40, y: 1988, w: WORLD_W - 80, h: 44 };
+  pedBlocks.push(promenade);
+  const beachPark = { x: 1150, y: 2080, w: 700, h: 130 };
+  lots.push(beachPark);
+  makeLotSpots(parkingSpots, beachPark, 10);
+  pois.beachPark = { x: 1500, y: 2145, label: 'Palms Beach Car Park' };
+  pois.goldSpot = { x: 1500, y: 2145, angle: 0 };
+  const docks = { x: 2760, y: 1960, w: 400, h: 320 };
+  pois.docks = { x: 2950, y: 2150, label: 'Solmar Docks' };
+  const warehouse = { x: 2800, y: 1990, w: 200, h: 110 };
+  buildings.push(warehouse);
+  drawJobs.push((g) => paintBeach(g, rng, beachPark, docks, warehouse));
+
+  // Street parking spots along a few avenues.
+  for (const ry of [700, 1500]) {
+    for (let x = 420; x < WORLD_W - 200; x += 210) {
+      if (ROADS_V.some((vx) => Math.abs(vx - x) < 90)) continue;
+      parkingSpots.push({ x, y: ry + HALF - 13, angle: 0 });
+    }
   }
 
-  const landmarks = {
-    docks: { x: 340, y: PROMENADE_Y, name: 'Solmar Docks' },
-    hotel: { x: 2740, y: PROMENADE_Y, name: 'Marina Grand Hotel' },
-    garage: { x: 640, y: 712, name: "Fenn's Garage" },
-    bank: { x: 1536, y: 1216, name: 'First Bank of Solmar' },
-    bankFront: { x: 1536, y: 1090, name: 'First Bank of Solmar' },
-    hideout: { x: 2900, y: 190, name: 'Cliffside Hideout' },
-    police: { x: 1408, y: 436, name: 'Solmar Police HQ' },
-    hospital: { x: 436, y: 1408, name: 'Solmar General Hospital' },
-    carPark: { x: 1950, y: 2296, name: 'Palms Beach Car Park' },
+  // Respawn / door points sit on the road in front of each POI.
+  pois.hospital.respawn = { x: 1700, y: 700 };
+  pois.police.respawn = { x: 1300, y: 1100 };
+  pois.garage.respawn = { x: 500, y: 1100 };
+
+  // Pre-render the static city once.
+  const canvas = document.createElement('canvas');
+  canvas.width = WORLD_W; canvas.height = WORLD_H;
+  const g = canvas.getContext('2d');
+  paintGround(g);
+  for (const job of drawJobs) job(g);
+  paintRoads(g);
+
+  return {
+    w: WORLD_W, h: WORLD_H, buildings, lots, pedBlocks, parkingSpots, pois,
+    canvas,
   };
-
-  function isRoad(x, y) {
-    if (y > WATER_Y) return false;
-    for (const cx of vRoads) if (Math.abs(x - cx) <= ROAD_W / 2 && y <= PROMENADE_Y + 28) return true;
-    for (const cy of hRoads) if (Math.abs(y - cy) <= ROAD_W / 2) return true;
-    if (Math.abs(y - PROMENADE_Y) <= 28) return true;
-    return false;
-  }
-
-  function isWater(x, y) {
-    return y > WATER_Y;
-  }
-
-  function pointInBuilding(x, y, pad = 0) {
-    for (const b of buildings) {
-      if (x >= b.x - pad && x <= b.x + b.w + pad && y >= b.y - pad && y <= b.y + b.h + pad) return true;
-    }
-    return false;
-  }
-
-  // Push a circle at (x, y) out of every building it touches.
-  function collideCircle(x, y, r) {
-    let hit = false;
-    for (const b of buildings) {
-      if (x < b.x - r - 4 || x > b.x + b.w + r + 4 || y < b.y - r - 4 || y > b.y + b.h + r + 4) continue;
-      const res = resolveCircleRect(x, y, r, b);
-      if (res.hit) {
-        x = res.x;
-        y = res.y;
-        hit = true;
-      }
-    }
-    return { x, y, hit };
-  }
-
-  function nearestIntersection(x, y) {
-    let best = intersections[0];
-    let bd = Infinity;
-    for (const p of intersections) {
-      const d = (p.x - x) * (p.x - x) + (p.y - y) * (p.y - y);
-      if (d < bd) {
-        bd = d;
-        best = p;
-      }
-    }
-    return best;
-  }
-
-  // Lane centre coordinate for a direction of travel on a road whose centre
-  // line is `centre` (right-hand traffic).
-  function laneCoord(dir, centre) {
-    if (dir === 'E') return centre + 18;
-    if (dir === 'W') return centre - 18;
-    if (dir === 'S') return centre - 18;
-    return centre + 18; // 'N'
-  }
-
-  const world = {
-    w: WORLD_W,
-    h: WORLD_H,
-    vRoads,
-    hRoads,
-    hAll,
-    intersections,
-    buildings,
-    parks,
-    lots,
-    palms,
-    landmarks,
-    isRoad,
-    isWater,
-    pointInBuilding,
-    collideCircle,
-    nearestIntersection,
-    laneCoord,
-    staticCanvas: null,
-  };
-  world.staticCanvas = renderStatic(world);
-  return world;
 }
 
-// Draw the whole city once onto an offscreen canvas.
-function renderStatic(world) {
-  const cv = document.createElement('canvas');
-  cv.width = world.w;
-  cv.height = world.h;
-  const c = cv.getContext('2d');
-  const { vRoads, hRoads } = world;
-
-  // Land base and sea.
-  c.fillStyle = '#b3a284';
-  c.fillRect(0, 0, world.w, world.h);
-  const sea = c.createLinearGradient(0, WATER_Y, 0, world.h);
-  sea.addColorStop(0, '#2e7fa8');
-  sea.addColorStop(1, '#1a567c');
-  c.fillStyle = sea;
-  c.fillRect(0, WATER_Y, world.w, world.h - WATER_Y);
-  c.strokeStyle = 'rgba(255,255,255,0.25)';
-  c.lineWidth = 2;
-  for (let i = 0; i < 46; i++) {
-    const y = WATER_Y + 14 + ((i * 53) % (world.h - WATER_Y - 20));
-    const x = (i * 271) % world.w;
-    c.beginPath();
-    c.moveTo(x, y);
-    c.lineTo(x + 46, y);
-    c.stroke();
+function buildPoi(drawJobs, buildings, pois, kind, b, rng) {
+  const cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+  const label = {
+    hideout: 'CLIFFSIDE HIDEOUT', hospital: 'HOSPITAL', garage: "FENN'S GARAGE",
+    police: 'POLICE HQ', bank: 'SOLMAR BANK', hotel: 'MARINA HOTEL',
+  }[kind];
+  pois[kind] = { x: cx, y: cy, label };
+  if (kind === 'hideout') {
+    const cabin = { x: cx - 55, y: cy - 40, w: 110, h: 80 };
+    buildings.push(cabin);
+    drawJobs.push((g) => {
+      g.fillStyle = '#6f9e57'; g.fillRect(b.x, b.y, b.w, b.h);
+      paintBuilding(g, cabin, '#8a6f4d');
+      g.fillStyle = 'rgba(0,0,0,0.55)';
+      g.font = 'bold 15px system-ui, sans-serif'; g.textAlign = 'center';
+      g.fillText(label, cx, b.y + b.h - 12);
+    });
+    return;
   }
-  // Sand.
-  c.fillStyle = '#ecd9a0';
-  c.fillRect(0, BEACH_Y, world.w, WATER_Y - BEACH_Y);
-  c.fillStyle = 'rgba(190,160,90,0.35)';
-  for (let i = 0; i < 130; i++) {
-    const x = (i * 197) % world.w;
-    const y = BEACH_Y + ((i * 89) % (WATER_Y - BEACH_Y));
-    c.fillRect(x, y, 9, 3);
-  }
-
-  // Sidewalks: a pale slab under every block.
-  c.fillStyle = '#cfc8bb';
-  for (let i = 0; i < 11; i++) {
-    for (let j = 0; j < 8; j++) {
-      const x0 = vRoads[i] + ROAD_W / 2 - 9;
-      const y0 = hRoads[j] + ROAD_W / 2 - 9;
-      const x1 = vRoads[i + 1] - ROAD_W / 2 + 9;
-      const y1 = hRoads[j + 1] - ROAD_W / 2 + 9;
-      c.fillRect(x0, y0, x1 - x0, y1 - y0);
+  const main = { x: b.x + 26, y: b.y + 30, w: b.w - 52, h: b.h - 92 };
+  buildings.push(main);
+  const roof = { police: '#7f9fc4', hospital: '#e8e4da', bank: '#c9a86a', hotel: '#e59a8a', garage: '#9aa3ab' }[kind];
+  drawJobs.push((g) => {
+    paintBuilding(g, main, roof);
+    if (kind === 'hospital') { // red cross on the roof
+      g.fillStyle = '#d23b3b';
+      g.fillRect(cx - 8, main.y + 18, 16, 44); g.fillRect(cx - 22, main.y + 32, 44, 16);
     }
-  }
-  // Block interiors not covered by parks/lots get a sandy lot tone.
-  for (let i = 0; i < 11; i++) {
-    for (let j = 0; j < 8; j++) {
-      const cell = {
-        x: vRoads[i] + ROAD_W / 2,
-        y: hRoads[j] + ROAD_W / 2,
-        w: PITCH - ROAD_W,
-        h: PITCH - ROAD_W,
+    if (kind === 'garage') { // open bays at the front
+      g.fillStyle = '#3a3f45';
+      for (let i = 0; i < 3; i++) g.fillRect(main.x + 18 + i * 52, main.y + main.h - 6, 38, 10);
+    }
+    g.fillStyle = 'rgba(0,0,0,0.6)';
+    g.font = 'bold 17px system-ui, sans-serif'; g.textAlign = 'center';
+    g.fillText(label, cx, b.y + b.h - 14);
+    // Forecourt
+    g.fillStyle = '#b7ab93'; g.fillRect(b.x + 10, main.y + main.h, b.w - 20, 30);
+  });
+  void rng;
+}
+
+function paintBuildings(g, b, buildings, rng) {
+  // Sidewalk slab first (painted under everything else in the block).
+  g.fillStyle = '#cfc4ae'; g.fillRect(b.x - 6, b.y - 6, b.w + 12, b.h + 12);
+  const n = 1 + Math.floor(rng() * 3);
+  const cellW = b.w / (n > 1 ? 2 : 1), cellH = b.h / (n > 2 ? 2 : 1);
+  let placed = 0;
+  for (let i = 0; i < 2 && placed < n; i++) {
+    for (let j = 0; j < 2 && placed < n; j++) {
+      const m = 14 + rng() * 10;
+      const rect = {
+        x: b.x + i * cellW + m, y: b.y + j * cellH + m,
+        w: cellW - m * 2, h: cellH - m * 2,
       };
-      const covered =
-        world.parks.some((p) => p.x === cell.x && p.y === cell.y) ||
-        world.lots.some((l) => l.x === cell.x && l.y === cell.y);
-      if (!covered) {
-        c.fillStyle = '#c2b294';
-        c.fillRect(cell.x, cell.y, cell.w, cell.h);
-      }
+      if (rect.w < 40 || rect.h < 40) continue;
+      buildings.push(rect);
+      paintBuilding(g, rect, ROOF_COLORS[Math.floor(rng() * ROOF_COLORS.length)]);
+      placed++;
     }
   }
+}
 
-  // Parks and parking lots sit on top of their sidewalk slabs.
-  for (const p of world.parks) {
-    c.fillStyle = '#7fae5f';
-    c.fillRect(p.x - 8, p.y - 8, p.w + 16, p.h + 16);
-    c.fillStyle = 'rgba(255,255,255,0.06)';
-    c.fillRect(p.x + 10, p.y + 10, p.w - 20, 26);
+function paintBuilding(g, r, roof) {
+  g.fillStyle = 'rgba(0,0,0,0.25)';
+  g.fillRect(r.x + 5, r.y + 7, r.w, r.h); // drop shadow
+  g.fillStyle = roof; g.fillRect(r.x, r.y, r.w, r.h);
+  g.strokeStyle = 'rgba(0,0,0,0.35)'; g.lineWidth = 2;
+  g.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+  g.fillStyle = 'rgba(255,255,255,0.35)';
+  const cols = Math.max(2, Math.floor(r.w / 26)), rows = Math.max(2, Math.floor(r.h / 26));
+  for (let i = 0; i < cols; i++) for (let j = 0; j < rows; j++) {
+    g.fillRect(r.x + 8 + i * 24, r.y + 8 + j * 24, 9, 9); // window glints
   }
-  for (const l of world.lots) {
-    c.fillStyle = '#77787c';
-    c.fillRect(l.x - 8, l.y - 8, l.w + 16, l.h + 16);
-    c.strokeStyle = 'rgba(255,255,255,0.5)';
-    c.lineWidth = 2;
-    for (let x = l.x + 12; x < l.x + l.w - 20; x += 34) {
-      c.strokeRect(x, l.y + 14, 26, 52);
-      c.strokeRect(x, l.y + l.h - 66, 26, 52);
+  g.fillStyle = 'rgba(0,0,0,0.18)';
+  g.fillRect(r.x + r.w * 0.55, r.y + r.h * 0.5, r.w * 0.3, r.h * 0.32); // rooftop unit
+}
+
+function paintPark(g, b, rng) {
+  g.fillStyle = '#5da85f'; g.fillRect(b.x - 6, b.y - 6, b.w + 12, b.h + 12);
+  g.strokeStyle = '#d9c9a3'; g.lineWidth = 10;
+  g.beginPath();
+  g.moveTo(b.x, b.y + b.h / 2); g.lineTo(b.x + b.w, b.y + b.h / 2);
+  g.moveTo(b.x + b.w / 2, b.y); g.lineTo(b.x + b.w / 2, b.y + b.h);
+  g.stroke();
+  for (let i = 0; i < 14; i++) {
+    const x = b.x + 16 + rng() * (b.w - 32), y = b.y + 16 + rng() * (b.h - 32);
+    g.fillStyle = '#2f7a3d'; g.beginPath(); g.arc(x, y, 13 + rng() * 7, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#3f9e4d'; g.beginPath(); g.arc(x - 3, y - 3, 8 + rng() * 5, 0, Math.PI * 2); g.fill();
+  }
+}
+
+function makeLotSpots(spots, lot, perRow) {
+  const cols = perRow ?? Math.max(3, Math.floor(lot.w / 64));
+  const rows = Math.max(1, Math.floor(lot.h / 64));
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      spots.push({
+        x: lot.x + 36 + c * ((lot.w - 72) / Math.max(1, cols - 1)),
+        y: lot.y + 34 + r * 62,
+        angle: -Math.PI / 2,
+        lot: true,
+      });
     }
   }
+}
 
-  // Roads.
-  c.fillStyle = '#4a4d52';
-  for (const cx of vRoads) c.fillRect(cx - ROAD_W / 2, 0, ROAD_W, PROMENADE_Y + 28);
-  for (const cy of hRoads) c.fillRect(0, cy - ROAD_W / 2, world.w, ROAD_W);
-  c.fillStyle = '#55575c';
-  c.fillRect(0, PROMENADE_Y - 28, world.w, 56);
-  // Edge lines and centre dashes.
-  c.strokeStyle = 'rgba(230,230,230,0.65)';
-  c.lineWidth = 2;
-  for (const cx of vRoads) {
-    c.beginPath();
-    c.moveTo(cx - ROAD_W / 2 + 3, 0);
-    c.lineTo(cx - ROAD_W / 2 + 3, PROMENADE_Y + 28);
-    c.moveTo(cx + ROAD_W / 2 - 3, 0);
-    c.lineTo(cx + ROAD_W / 2 - 3, PROMENADE_Y + 28);
-    c.stroke();
+function paintLot(g, b) {
+  g.fillStyle = '#555a61'; g.fillRect(b.x - 4, b.y - 4, b.w + 8, b.h + 8);
+  g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 2;
+  const cols = Math.max(3, Math.floor(b.w / 64)), rows = Math.max(1, Math.floor(b.h / 64));
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x = b.x + 36 + c * ((b.w - 72) / Math.max(1, cols - 1));
+      g.strokeRect(x - 15, b.y + 34 + r * 62 - 24, 30, 48);
+    }
   }
-  for (const cy of hRoads) {
-    c.beginPath();
-    c.moveTo(0, cy - ROAD_W / 2 + 3);
-    c.lineTo(world.w, cy - ROAD_W / 2 + 3);
-    c.moveTo(0, cy + ROAD_W / 2 - 3);
-    c.lineTo(world.w, cy + ROAD_W / 2 - 3);
-    c.stroke();
-  }
-  c.strokeStyle = '#e8c766';
-  c.lineWidth = 3;
-  c.setLineDash([22, 18]);
-  for (const cx of vRoads) {
-    c.beginPath();
-    c.moveTo(cx, 0);
-    c.lineTo(cx, PROMENADE_Y + 28);
-    c.stroke();
-  }
-  for (const cy of hRoads) {
-    c.beginPath();
-    c.moveTo(0, cy);
-    c.lineTo(world.w, cy);
-    c.stroke();
-  }
-  c.setLineDash([]);
+}
 
-  // Buildings with a soft shadow and a roof inset.
+function paintBeach(g, rng, beachPark, docks, warehouse) {
+  // Sand
+  g.fillStyle = '#eed9a3'; g.fillRect(0, BEACH_Y, WORLD_W, WORLD_H - BEACH_Y);
+  // Promenade
+  g.fillStyle = '#d9c9a3'; g.fillRect(0, 1976, WORLD_W, 60);
+  g.fillStyle = 'rgba(0,0,0,0.15)'; g.fillRect(0, 1976, WORLD_W, 3); g.fillRect(0, 2033, WORLD_W, 3);
+  // Palms along the promenade
+  for (let x = 90; x < WORLD_W; x += 170) {
+    if (x > docks.x - 40 && x < docks.x + docks.w) continue;
+    g.fillStyle = '#2f7a3d'; g.beginPath(); g.arc(x, 2006, 15, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#3f9e4d'; g.beginPath(); g.arc(x - 4, 2002, 9, 0, Math.PI * 2); g.fill();
+  }
+  // Beach car park
+  paintLot(g, beachPark);
+  g.fillStyle = 'rgba(0,0,0,0.55)'; g.font = 'bold 16px system-ui, sans-serif'; g.textAlign = 'center';
+  g.fillText('PALMS BEACH CAR PARK', beachPark.x + beachPark.w / 2, beachPark.y + beachPark.h + 24);
+  // Docks: yard, warehouse, crates, piers
+  g.fillStyle = '#8d8272'; g.fillRect(docks.x, docks.y, docks.w, docks.h);
+  paintBuilding(g, warehouse, '#a0855c');
+  g.fillStyle = 'rgba(0,0,0,0.6)'; g.font = 'bold 16px system-ui, sans-serif';
+  g.fillText('SOLMAR DOCKS', docks.x + 100, docks.y + 24);
+  for (let i = 0; i < 12; i++) {
+    const x = docks.x + 20 + rng() * (docks.w - 60), y = docks.y + 140 + rng() * 150;
+    g.fillStyle = ['#b5651d', '#8a6f4d', '#707880'][i % 3];
+    g.fillRect(x, y, 26, 26);
+    g.strokeStyle = 'rgba(0,0,0,0.3)'; g.strokeRect(x, y, 26, 26);
+  }
+  g.fillStyle = '#7a5c38';
+  for (const px of [docks.x + 40, docks.x + 190, docks.x + 320]) {
+    g.fillRect(px, WATER_Y, 34, WORLD_H - WATER_Y); // piers into the sea
+  }
+  // Umbrellas on the sand
+  for (let i = 0; i < 16; i++) {
+    const x = 80 + rng() * (WORLD_W - 500), y = 2160 + rng() * 90;
+    if (x > beachPark.x - 20 && x < beachPark.x + beachPark.w + 20 && y < beachPark.y + beachPark.h + 30) continue;
+    g.fillStyle = ['#e2543e', '#f2b138', '#3f8fbf'][i % 3];
+    g.beginPath(); g.arc(x, y, 11, 0, Math.PI * 2); g.fill();
+  }
+}
+
+function paintGround(g) {
+  g.fillStyle = '#a89a80'; g.fillRect(0, 0, WORLD_W, WORLD_H); // dry city pavement
+  // Sea
+  const grad = g.createLinearGradient(0, WATER_Y, 0, WORLD_H);
+  grad.addColorStop(0, '#3d94c9'); grad.addColorStop(1, '#1b5e8f');
+  g.fillStyle = grad; g.fillRect(0, WATER_Y, WORLD_W, WORLD_H - WATER_Y);
+  g.strokeStyle = 'rgba(255,255,255,0.5)'; g.lineWidth = 2;
+  for (let x = 30; x < WORLD_W; x += 90) {
+    g.beginPath(); g.arc(x, WATER_Y + 34, 16, Math.PI * 0.15, Math.PI * 0.85); g.stroke();
+    g.beginPath(); g.arc(x + 40, WATER_Y + 74, 13, Math.PI * 0.15, Math.PI * 0.85); g.stroke();
+  }
+  g.fillStyle = '#f4e6bb'; g.fillRect(0, WATER_Y - 8, WORLD_W, 10); // waterline foam
+}
+
+function paintRoads(g) {
+  g.fillStyle = '#3d4148';
+  for (const x of ROADS_V) g.fillRect(x - HALF, 0, ROAD_W, BEACH_Y + 20);
+  for (const y of ROADS_H) g.fillRect(0, y - HALF, WORLD_W, ROAD_W);
+  // Edge lines
+  g.fillStyle = '#e8e4da';
+  for (const x of ROADS_V) { g.fillRect(x - HALF + 2, 0, 3, BEACH_Y + 20); g.fillRect(x + HALF - 5, 0, 3, BEACH_Y + 20); }
+  for (const y of ROADS_H) { g.fillRect(0, y - HALF + 2, WORLD_W, 3); g.fillRect(0, y + HALF - 5, WORLD_W, 3); }
+  // Centre dashes
+  g.fillStyle = '#d8b93a';
+  for (const x of ROADS_V) for (let y = 8; y < BEACH_Y; y += 44) g.fillRect(x - 2, y, 4, 24);
+  for (const y of ROADS_H) for (let x = 8; x < WORLD_W; x += 44) g.fillRect(x, y - 2, 24, 4);
+}
+
+// --- Queries used by the rest of the game ---
+
+export function isOnRoad(x, y) {
+  for (const vx of ROADS_V) if (Math.abs(x - vx) <= HALF + 4 && y < BEACH_Y + 24) return true;
+  for (const hy of ROADS_H) if (Math.abs(y - hy) <= HALF + 4) return true;
+  return false;
+}
+
+// Push a circle (entity) out of all buildings, the sea and the world edge.
+export function collide(world, x, y, r) {
+  let hit = false;
   for (const b of world.buildings) {
-    c.fillStyle = 'rgba(60,45,30,0.20)';
-    c.fillRect(b.x + 6, b.y + 8, b.w, b.h);
-    c.fillStyle = b.color;
-    c.fillRect(b.x, b.y, b.w, b.h);
-    c.fillStyle = b.roof;
-    c.fillRect(b.x + 7, b.y + 7, b.w - 14, b.h - 14);
-    c.fillStyle = 'rgba(255,255,255,0.20)';
-    c.fillRect(b.x + 14, b.y + 14, Math.max(0, b.w - 28), 8);
+    const res = circleRectResolve(x, y, r, b);
+    if (res.hit) { x = res.x; y = res.y; hit = true; }
   }
+  if (y > WATER_Y - r) { y = WATER_Y - r; hit = true; }
+  x = clamp(x, r, WORLD_W - r);
+  y = clamp(y, r, WORLD_H - r);
+  return { x, y, hit };
+}
 
-  // Docks: crates and a jetty on the promenade's west end.
-  c.fillStyle = '#8a6f4d';
-  for (let i = 0; i < 7; i++) {
-    const x = 190 + (i % 4) * 44;
-    const y = 2196 + Math.floor(i / 4) * 40;
-    c.fillRect(x, y, 34, 30);
-    c.strokeStyle = 'rgba(0,0,0,0.25)';
-    c.strokeRect(x, y, 34, 30);
+export function intersections() {
+  const pts = [];
+  for (const x of ROADS_V) for (const y of ROADS_H) pts.push({ x, y });
+  return pts;
+}
+
+// Intersections directly reachable from (x,y) along its road.
+export function nextIntersections(x, y) {
+  const out = [];
+  if (ROADS_V.includes(x)) {
+    const i = ROADS_H.indexOf(y);
+    if (i > 0) out.push({ x, y: ROADS_H[i - 1] });
+    if (i < ROADS_H.length - 1) out.push({ x, y: ROADS_H[i + 1] });
   }
-  c.fillStyle = '#9b7d55';
-  c.fillRect(240, WATER_Y - 6, 26, 96);
-
-  // Palm trees: trunk plus a star of fronds.
-  for (const p of world.palms) {
-    c.strokeStyle = '#7a5c38';
-    c.lineWidth = 3 * p.s;
-    c.beginPath();
-    c.moveTo(p.x, p.y);
-    c.lineTo(p.x + 3 * p.s, p.y - 6 * p.s);
-    c.stroke();
-    c.strokeStyle = '#3f8f4f';
-    c.lineWidth = 2.4 * p.s;
-    for (let k = 0; k < 6; k++) {
-      const a = (k / 6) * Math.PI * 2 + p.x;
-      c.beginPath();
-      c.moveTo(p.x + 3 * p.s, p.y - 6 * p.s);
-      c.lineTo(p.x + 3 * p.s + Math.cos(a) * 13 * p.s, p.y - 6 * p.s + Math.sin(a) * 8 * p.s - 3);
-      c.stroke();
-    }
+  if (ROADS_H.includes(y)) {
+    const i = ROADS_V.indexOf(x);
+    if (i > 0) out.push({ x: ROADS_V[i - 1], y });
+    if (i < ROADS_V.length - 1) out.push({ x: ROADS_V[i + 1], y });
   }
-
-  // Painted landmark names on the ground.
-  c.fillStyle = 'rgba(255,255,255,0.5)';
-  c.font = 'bold 17px system-ui, sans-serif';
-  c.textAlign = 'center';
-  const label = (x, y, text) => c.fillText(text, x, y);
-  label(340, 2206, 'SOLMAR DOCKS');
-  label(2740, 2206, 'MARINA GRAND');
-  label(640, 668, "FENN'S GARAGE");
-  label(1536, 1180, 'FIRST BANK');
-  label(1408, 402, 'POLICE HQ');
-  label(436, 1364, 'HOSPITAL');
-
-  return cv;
+  return out;
 }
